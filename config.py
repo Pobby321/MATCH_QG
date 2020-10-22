@@ -26,12 +26,12 @@ max_len = 400
 num_layers = 2
 hidden_size = 300
 embedding_size = 300
-lr = 0.1
+lr = 0.01
 batch_size = 64
 dropout_keep = 0.3
 max_grad_norm = 5.0
 
-use_pointer = True
+use_pointer = False
 beam_size = 10
 min_decode_step = 8
 max_decode_step = 30

@@ -221,7 +221,8 @@ class Seq2seq():
         self.logits = self.decode(sos_trg, self.ext_src_seq,
                               enc_states, enc_outputs, enc_mask)
         self.loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=sos_trg,logits=self.logits)
-        self.opt = tf.train.AdamOptimizer(config['lr'])
+
+        self.opt = tf.train.AdamOptimizer(config.lr)
         tvars = tf.trainable_variables()
         grads = tf.gradients(self.loss, tvars)
         (grads, _) = tf.clip_by_global_norm(grads, clip_norm=1.0)
@@ -264,69 +265,77 @@ class Seq2seq():
         f_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
         b_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
         outputs_, states = tf.nn.bidirectional_dynamic_rnn(f_cell,b_cell,embedded,dtype=tf.float32)
-
-        # packed = pack_padded_sequence(embedded,
-        #                               src_len,
-        #                               batch_first=True,
-        #                               )
-        # outputs, states = self.lstm(packed)  # states : tuple of [4, b, d]
-        # outputs, _ = pad_packed_sequence(outputs,
-        #                                  batch_first=True,
-        #                                  total_length=total_length)  # [b, t, d]
+        # _inputs = embedded
+        # for _ in range(self.num_layers):
+        #     # 为什么在这加个variable_scope,被逼的,tf在rnn_cell的__call__中非要搞一个命名空间检查
+        #     # 恶心的很.如果不在这加的话,会报错的.
+        #     with tf.variable_scope(None, default_name="bidirectional-rnn"):
+        #         f_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
+        #         b_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
+        #         (output, state) = tf.nn.bidirectional_dynamic_rnn(f_cell, b_cell, _inputs,dtype=tf.float32)
+        #         _inputs = tf.concat(output, 2)
+        # cells_fw = [self.gru_cell() for _ in range(self.n_layer)]
+        # cells_bw = [self.gru_cell() for _ in range(self.n_layer)]
+        # initial_states_fw = [cell_fw.zero_state(self.batch_size, tf.float32) for cell_fw in cells_fw]
+        # initial_states_bw = [cell_bw.zero_state(self.batch_size, tf.float32) for cell_bw in cells_bw]
+        # outputs, _, _ = rnn.stack_bidirectional_dynamic_rnn(cells_fw, cells_bw, inputs,
+        #                                                     initial_states_fw=initial_states_fw,
+        #                                                     initial_states_bw=initial_states_bw, dtype=tf.float32)
         outputs = tf.concat(outputs_,-1)
-        h, c = states
+        (f_c, f_h),(b_c,b_h) = states
 
         # self attention
         mask = tf.sign(src_seq)
         memories = tf.layers.dense(outputs,2*self.hidden_size)
         outputs = self.gated_self_attn(outputs, memories, mask)
 
-        _, b, d = h.get_shape().as_list()
-        h = tf.reshape(h,shape=(2, 2, b, d))
-        # h = h.view(2, 2, b, d)  # [n_layers, bi, b, d]
-        h = tf.concat((h[:, 0, :, :], h[:, 1, :, :]), axis=-1)
+        # _, b, d = h.get_shape().as_list()
+        # h = tf.reshape(h,shape=(2, 2, b, d))
+        # # h = h.view(2, 2, b, d)  # [n_layers, bi, b, d]
+        # h = tf.concat((h[:, 0, :, :], h[:, 1, :, :]), axis=-1)
+        #
+        # c = tf.reshape(c,shape=(2, 2, b, d))
+        # c = tf.concat((c[:, 0, :, :], c[:, 1, :, :]), axis=-1)
+        concat_states = (f_h, b_h)
 
-        c = tf.reshape(c,shape=(2, 2, b, d))
-        c = tf.concat((c[:, 0, :, :], c[:, 1, :, :]), axis=-1)
-        concat_states = (h, c)
+        return outputs, states
 
-        return outputs, concat_states
-
-    def attention(query, memories, mask):
+    def attention(self,query, memories, mask):
         # query : [b, 1, d]
-        energy = tf.matmul(query,tf.transpose(memories,shape=(1, 2))) # [b, 1, t]
+        energy = tf.matmul(query,tf.transpose(memories,perm=(0,2,1))) # [b, 1, t]
         energy = tf.squeeze(energy,1)
-        energy =energy - (1 - mask)*INF
-        attn_dist = tf.tile(tf.nn.softmax(energy, dim=1),1)  # [b, 1, t]
+        # energy =energy - tf.multiply((1 - mask),INF)
+        energy = tf.where(tf.equal(mask,1),energy,tf.zeros_like(energy)*INF)
+        attn_dist = tf.expand_dims(tf.nn.softmax(energy, axis=1),1)  # [b, 1, t]
         context_vector = tf.matmul(attn_dist, memories)  # [b, 1, d]
 
         return context_vector, energy
 
     def get_encoder_features(self, encoder_outputs):
-        return tf.layers.dense(encoder_outputs,self.hidden_size)
+        return tf.layers.dense(encoder_outputs,self.hidden_size*2)
 
-    def decode(self, trg_seq, ext_src_seq, init_states, encoder_outputs, encoder_mask):
+    def decode(self, trg_seq, ext_src_seq, init_state, encoder_outputs, encoder_mask):
         # trg_seq : [b,t]
         # init_states : [2,b,d]
         # encoder_outputs : [b,t,d]
         # init_states : a tuple of [2, b, d]
 
-        batch_size, max_len = tf.shape(trg_seq)
+        batch_size, max_len = trg_seq.get_shape().as_list()
 
         hidden_size = encoder_outputs.get_shape().as_list()[-1]
         memories = self.get_encoder_features(encoder_outputs)
         logits = []
         # init decoder hidden states and context vector
-        prev_states = init_states
-        prev_context = tf.zeros((batch_size, 1, hidden_size))
+        prev_states = init_state
+        prev_context = tf.zeros((tf.shape(trg_seq)[0], 1, hidden_size))
         for i in range(max_len):
-            y_i = tf.tile(trg_seq[:, i],1) # [b, 1]
+            y_i = tf.expand_dims(trg_seq[:, i],1) # [b, 1]
             embedded = tf.nn.embedding_lookup(self.embedding,y_i)
             lstm_inputs = tf.layers.dense(
                 tf.concat([embedded, prev_context], 2),self.embedding_size)
-            f_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
-            b_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size)
-            outputs_, states = tf.nn.bidirectional_dynamic_rnn(f_cell, b_cell, lstm_inputs,init_states=prev_states)
+            f_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size,name='cell_fw_{}'.format(i))
+            b_cell = tf.nn.rnn_cell.LSTMCell(self.hidden_size,name='cell_bw_{}'.format(i))
+            outputs_, states = tf.nn.bidirectional_dynamic_rnn(f_cell, b_cell, lstm_inputs,initial_state_fw=prev_states[0],initial_state_bw=prev_states[1])
             output = tf.concat(outputs_,2)
             # encoder-decoder attention
             context, energy = self.attention(output, memories, encoder_mask)
@@ -336,15 +345,16 @@ class Seq2seq():
 
             # maxout pointer network
             if config.use_pointer:
-                num_oov = max(tf.reduce_max(ext_src_seq - self.vocab_size + 1), 0)
+                num_oov = tf.reduce_max(tf.reduce_max(ext_src_seq - self.vocab_size + 1), 0)
                 zeros = tf.zeros((batch_size, num_oov))
-                extended_logit = tf.concat([logit, zeros], dim=1)
+                extended_logit = tf.concat([logit, zeros], axis=1)
                 out = tf.zeros_like(extended_logit) - INF
                 out = tf.compat.v1.scatter_max(out,energy, ext_src_seq)
                 # out, _ = scatter_max(energy, ext_src_seq, out=out)
                 out = tf.where(tf.equal(out,-INF),tf.zeros_like(out),out)
                 logit = extended_logit + out
                 tf.where(tf.equal(logit, 0), tf.ones_like(logit)*(-INF), logit)
+                logit = tf.where(tf.equal(logit,0),)
                 logit = logit.masked_fill(logit == 0, -INF)
 
             logits.append(logit)
@@ -352,7 +362,7 @@ class Seq2seq():
             prev_states = states
             prev_context = context
 
-        logits = tf.stack(logits, dim=1)  # [b, t, |V|]
+        logits = tf.stack(logits, axis=1)  # [b, t, |V|]
 
 
         return logits
